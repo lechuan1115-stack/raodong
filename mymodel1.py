@@ -136,9 +136,16 @@ _FACTORY = {
     'cnn-transformer': CNNTransformer,
 }
 
+_ALIASES = {
+    'p4net': 'p4',
+    'p4-all': 'p4',
+    'p4_all': 'p4',
+}
+
 
 def create(name, num_classes, fs=50e6, debug_first=False, **kwargs):
-    key = name.lower()
+    key = name.strip().lower()
+    key = _ALIASES.get(key, key)
     if key not in _FACTORY:
         raise KeyError(f"Unknown model: {name}")
     if key in ('p4', 'p4all'):
