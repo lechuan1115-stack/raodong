@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-import os, time, json, csv, argparse, datetime, os.path as osp
+import os, time, json, csv, datetime, os.path as osp
+from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
@@ -201,41 +202,26 @@ def train_one_epoch(model, criterion, optimizer, loader, device, args):
 
 
 @torch.no_grad()
-def evaluate(model, criterion, loader, device, args, mode="normal", print_debug=False):
+def evaluate(model, criterion, loader, device, args, print_debug=False):
     model.eval()
+    _set_steer_disabled(model, False)
 
-    bak_shuffle, bak_zeroz, bak_zeros = args.shuffle_z, args.zero_z, args.zero_s
-    try:
-        if mode == "no_steer":
-            _set_steer_disabled(model, True)
-            args.shuffle_z, args.zero_z, args.zero_s = False, False, False
-        elif mode == "shuffle_z":
-            _set_steer_disabled(model, False)
-            args.shuffle_z, args.zero_z, args.zero_s = True, False, False
-        else:
-            _set_steer_disabled(model, False)
-            args.shuffle_z, args.zero_z, args.zero_s = False, False, False
+    losses = AverageMeter()
+    correct = total = 0
+    last_dbg = {}
 
-        print(f"[EVAL MODE] {mode} | steer_disabled={'True' if (mode=='no_steer') else 'False'}")
+    for batch in loader:
+        logits, feat, y, dbg = _forward(model, batch, device, args, want_debug=print_debug)
+        loss = criterion(logits, y)
+        losses.update(loss.item(), y.size(0))
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item(); total += y.size(0)
+        if dbg:
+            last_dbg = dbg
 
-        losses = AverageMeter()
-        correct = total = 0
-        last_dbg = {}
-
-        for batch in loader:
-            logits, feat, y, dbg = _forward(model, batch, device, args, want_debug=print_debug)
-            loss = criterion(logits, y)
-            losses.update(loss.item(), y.size(0))
-            pred = logits.argmax(1)
-            correct += (pred == y).sum().item(); total += y.size(0)
-            if dbg: last_dbg = dbg
-
-        acc = 100.0 * correct / max(1, total)
-        if print_debug and last_dbg:
-            print("[FirstLayer Debug]", last_dbg)
-    finally:
-        args.shuffle_z, args.zero_z, args.zero_s = bak_shuffle, bak_zeroz, bak_zeros
-        _set_steer_disabled(model, False)
+    acc = 100.0 * correct / max(1, total)
+    if print_debug and last_dbg:
+        print("[FirstLayer Debug]", last_dbg)
 
     return acc, losses.avg
 
@@ -352,7 +338,7 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     for epoch in range(args.max_epoch):
         print(f"==> Epoch {epoch+1}/{args.max_epoch}")
         a_tr, l_tr = train_one_epoch(model, criterion, optimizer, trainloader, device, args)
-        a_ev, l_ev = evaluate(model, criterion, valloader, device, args, mode="normal", print_debug=args.first_debug)
+        a_ev, l_ev = evaluate(model, criterion, valloader, device, args, print_debug=args.first_debug)
         print(f"Train_Acc(%): {a_tr:.2f}  Eval_Acc(%): {a_ev:.2f}")
         print(f"Train_Loss: {l_tr:.4f}  Eval_Loss: {l_ev:.4f}")
 
@@ -383,25 +369,17 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     elapsed = time.time() - t0
     print("训练耗时：", str(datetime.timedelta(seconds=round(elapsed))))
 
-    # 测试 & 对照评估
+    # 验证 & 测试
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    print("####### 测试")
-    _ , _ = evaluate(model, criterion, valloader, device, args, mode="normal", print_debug=True)
-
-    print("== 对照评估（验证集）==")
-    acc_n, _  = evaluate(model, criterion, valloader, device, args, mode='normal')
-    acc_ns, _ = evaluate(model, criterion, valloader, device, args, mode='no_steer')
-    acc_sz, _ = evaluate(model, criterion, valloader, device, args, mode='shuffle_z')
-    print(f"[COMPARE] normal={acc_n:.2f}% | no_steer={acc_ns:.2f}% | shuffle_z={acc_sz:.2f}%")
+    print("####### 验证集评估")
+    acc_val, _ = evaluate(model, criterion, valloader, device, args, print_debug=True)
 
     print("####### 最终测试集指标")
     test_stats = test_metrics(model, testloader, device, args)
     print(f"Top1:{test_stats['top1']:5.2f}%  Top2:{test_stats['top2']:5.2f}%  Top3:{test_stats['top3']:5.2f}%  Top5:{test_stats['top5']:5.2f}%")
 
     metrics = {
-        "val_normal": float(acc_n),
-        "val_no_steer": float(acc_ns),
-        "val_shuffle_z": float(acc_sz),
+        "val_acc": float(acc_val),
         "test_top1": float(test_stats['top1']),
         "test_top2": float(test_stats['top2']),
         "test_top3": float(test_stats['top3']),
@@ -447,7 +425,7 @@ def plot_model_comparison(results, output_path):
     if not results:
         return
 
-    metric_keys = ["val_normal", "val_no_steer", "val_shuffle_z", "test_top1", "test_top2", "test_top3", "test_top5"]
+    metric_keys = ["val_acc", "test_top1", "test_top2", "test_top3", "test_top5"]
     x = np.arange(len(metric_keys))
     width = 0.8 / max(len(results), 1)
 
@@ -484,80 +462,66 @@ def plot_model_comparison(results, output_path):
 
 
 def main():
-    parser = argparse.ArgumentParser("P4All vs CNN-Transformer benchmark")
-    parser.add_argument('--data', type=str, default='./data/ADS-B_0dB_train.mat')
-    parser.add_argument('--save-root', type=str, default='./runs_benchmark')
-    parser.add_argument('--class_num', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--workers', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--wd', type=float, default=1e-4)
-    parser.add_argument('--max-epoch', type=int, default=100)
-    parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--gpu', type=str, default='0')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--first_debug', action='store_true')
-    parser.add_argument('--print_freq', type=int, default=5, help='打印间隔（iteration）')
+    """入口函数：直接在此修改数据路径和训练参数。"""
 
-    # z/s 评估开关
-    parser.add_argument('--shuffle_z', action='store_true')
-    parser.add_argument('--zero_z', action='store_true')
-    parser.add_argument('--zero_s', action='store_true')
+    config = SimpleNamespace(
+        data='./data/ADS-B_0dB_train.mat',
+        save_root='./runs_benchmark',
+        class_num=100,
+        batch_size=256,
+        workers=0,
+        lr=1e-4,
+        wd=1e-4,
+        max_epoch=100,
+        patience=20,
+        gpu='0',
+        seed=42,
+        first_debug=False,
+        print_freq=5,
+        shuffle_z=False,
+        zero_z=False,
+        zero_s=False,
+        coef_scale=0.5,
+        coef_gain=0.5,
+        coef_cfo=0.5,
+        coef_chirp=0.5,
+        prior_drop=0.0,
+        s_jitter=0.0,
+        mixup_alpha=0.2,
+        model_names=['p4all', 'cnn-transformer'],
+    )
 
-    # 选择模型
-    parser.add_argument('--models', type=str, default='p4all,cnn-transformer',
-                        help='逗号分隔的模型列表，可选: p4all, cnn-transformer')
-
-    # steer 强度与先验衰减
-    parser.add_argument('--coef-scale', type=float, default=0.5)
-    parser.add_argument('--coef-gain',  type=float, default=0.5)
-    parser.add_argument('--coef-cfo',   type=float, default=0.5)
-    parser.add_argument('--coef-chirp', type=float, default=0.5)
-    parser.add_argument('--prior-drop', type=float, default=0.3,
-                        help='随机丢弃先验 z/s 的概率 [0,1]')
-    parser.add_argument('--s-jitter',   type=float, default=0.2,
-                        help='对先验 s 的乘性噪声幅度，0为不抖动')
-
-    # Mixup
-    parser.add_argument('--mixup-alpha', type=float, default=0.2)
-
-    args = parser.parse_args()
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    os.environ['CUDA_VISIBLE_DEVICES'] = config.gpu
     use_gpu = torch.cuda.is_available()
     device = torch.device('cuda') if use_gpu else torch.device('cpu')
-    torch.manual_seed(args.seed)
-    if use_gpu: torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(config.seed)
+    if use_gpu:
+        torch.cuda.manual_seed_all(config.seed)
 
-    requested = [m.strip().lower() for m in args.models.split(',') if m.strip()]
-    valid_models = {'p4all', 'cnn-transformer'}
-    models = []
-    for m in requested:
-        if m not in valid_models:
-            raise ValueError(f"未知模型: {m}. 可选 {sorted(valid_models)}")
-        if m not in models:
-            models.append(m)
+    print("程序：P4All 与 CNN-Transformer 对比训练")
+    print(f"数据路径：{config.data}")
+    print(f"模型列表：{config.model_names}")
+    print(
+        "Steer系数: "
+        f"scale={config.coef_scale} gain={config.coef_gain} "
+        f"cfo={config.coef_cfo} chirp={config.coef_chirp}"
+    )
 
-    print(f"程序：闭集识别（群作用验证，对比分析）")
-    print(f"数据：{args.data}")
-    print(f"模型列表：{models}")
-    print(f"Steer系数: scale={args.coef_scale} gain={args.coef_gain} cfo={args.coef_cfo} chirp={args.coef_chirp} | prior_drop={args.prior_drop} s_jitter={args.s_jitter}")
-
-    os.makedirs(args.save_root, exist_ok=True)
+    os.makedirs(config.save_root, exist_ok=True)
 
     all_results = []
-    for m in models:
-        save_dir = osp.join(args.save_root, m)
-        result = run_one_model(args, m, args.data, save_dir, device)
+    for name in config.model_names:
+        save_dir = osp.join(config.save_root, name)
+        result = run_one_model(config, name, config.data, save_dir, device)
         all_results.append(result)
 
     if len(all_results) >= 2:
-        compare_path = osp.join(args.save_root, 'model_comparison.png')
+        compare_path = osp.join(config.save_root, 'model_comparison.png')
         plot_model_comparison(all_results, compare_path)
         print(f"[PLOT] 模型对比图已生成: {compare_path}")
 
-        metrics_csv = osp.join(args.save_root, 'model_comparison.csv')
-        metric_keys = ["val_normal", "val_no_steer", "val_shuffle_z", "test_top1", "test_top2", "test_top3", "test_top5", "best_epoch", "best_val_loss", "best_val_acc", "train_time_sec"]
+        metrics_csv = osp.join(config.save_root, 'model_comparison.csv')
+        metric_keys = ["val_acc", "test_top1", "test_top2", "test_top3", "test_top5", "best_epoch", "best_val_loss", "best_val_acc", "train_time_sec"]
         write_header = (not osp.exists(metrics_csv))
         with open(metrics_csv, 'a', newline='', encoding='utf-8') as f:
             writer = csv.DictWriter(f, fieldnames=["model"] + metric_keys)
