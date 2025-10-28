@@ -116,7 +116,19 @@ def _maybe_read_S(hf, N):
 
     return None
 
+def _is_mat73(mat_path):
+    try:
+        with open(mat_path, 'rb') as fh:
+            header = fh.read(128)
+        return b'MATLAB 7.3 MAT-file' in header
+    except OSError:
+        return False
+
+
 def _load_mat_dict(mat_path):
+    if _is_mat73(mat_path):
+        print("[INFO] detected MATLAB v7.3 MAT-file, routing to HDF5 loader")
+        return None
     if loadmat is None:
         raise ImportError("scipy.io.loadmat 未安装，无法读取 .mat 数据")
     kwargs = dict(struct_as_record=False, squeeze_me=True)
@@ -166,6 +178,8 @@ def _mat_coerce_numeric(obj):
 
 
 def _mat_pick(mdict, candidates):
+    if mdict is None:
+        return None
     for key in candidates:
         if key in mdict:
             return _mat_coerce_numeric(mdict[key])
@@ -276,6 +290,9 @@ def load_h5_with_perturb(h5_path, for_p4=True, shuffle=True, seed=42):
 def load_mat_with_perturb(mat_path, for_p4=True, shuffle=True, seed=42):
     mat_path = _check_path(mat_path)
     mdict = _load_mat_dict(mat_path)
+    if mdict is None:
+        # MATLAB v7.3 -> 直接当做 HDF5 读取
+        return load_h5_with_perturb(mat_path, for_p4=for_p4, shuffle=shuffle, seed=seed)
     print(json.dumps({"keys": sorted(mdict.keys())}, ensure_ascii=False))
 
     A = _mat_pick(mdict, ['train', 'data', 'IQ', 'iq', 'iq_data', 'signal', 'x', 'data_iq', 'test'])
