@@ -297,7 +297,7 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     summarize_zs(valloader,  tag="val",   max_batches=50)
 
     # 模型（根据类型选择参数）
-    if model_name == 'p4all':
+    if model_name in ('p4', 'p4all'):
         model = mymodel1.create(
             name=model_name,
             num_classes=args.class_num,
@@ -488,7 +488,7 @@ def main():
         prior_drop=0.0,
         s_jitter=0.0,
         mixup_alpha=0.2,
-        model_names=['p4all', 'cnn-transformer'],
+        model_names=['p4', 'cnn-transformer'],
     )
 
     os.environ['CUDA_VISIBLE_DEVICES'] = config.gpu
@@ -498,7 +498,7 @@ def main():
     if use_gpu:
         torch.cuda.manual_seed_all(config.seed)
 
-    print("程序：P4All 与 CNN-Transformer 对比训练")
+    print("程序：P4 与 CNN-Transformer 对比训练")
     print(f"数据路径：{config.data}")
     print(f"模型列表：{config.model_names}")
     print(
