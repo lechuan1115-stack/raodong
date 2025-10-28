@@ -72,10 +72,23 @@ def steer_gain_filters_per_sample(w, rho, theta):
     rho = rho[:,None,None,None,None]
     return rho * w
 
+def steer_shift_filters_per_sample(w, shift):
+    """Apply circular time shift to the kernels on a per-sample basis."""
+    B, _, _, _, _ = w.shape
+    shift = shift.to(torch.int64)
+    if torch.all(shift == 0):
+        return w
+    w_out = w.clone()
+    for b in range(B):
+        k = int(shift[b].item())
+        if k != 0:
+            w_out[b] = torch.roll(w_out[b], shifts=k, dims=-1)
+    return w_out
+
 class SteerableFirstLayerPerSample(nn.Module):
     """
     逐样本群等变第一层：基核 + 核转向 + grouped conv
-    顺序：SCALE -> CFO -> CHIRP -> GAIN  （SHIFT 不对核做作用）
+    顺序：SCALE -> CFO -> CHIRP -> GAIN -> SHIFT，逐项检测对应扰动后再启用。
     新增：coef_* 参数可调扰动强度
     """
     def __init__(self, in_ch=2, out_ch=32, k=5,
@@ -128,34 +141,36 @@ class SteerableFirstLayerPerSample(nn.Module):
         wB = w0.unsqueeze(0).repeat(B,1,1,1,1)   # [B,OC,IC,1,kW]
         fs = torch.tensor(self.fs, dtype=torch.float32, device=x.device)
 
-        # mask：未激活用中性值
-        def _mask_param(col_idx, neutral):
-            m = (z[:, col_idx] > 0.5)
-            p = torch.nan_to_num(s[:, col_idx])
-            p = torch.where(m, p, torch.full_like(p, neutral))
-            return p
+        applied = {tag: False for tag in PERTURB_ORDER}
 
-        # === 强度缩放：围绕中性点缩放 ===
-        # SCALE: 1 -> 中性；alpha' = 1 + coef_scale * (alpha - 1)
-        alpha = _mask_param(PERTURB_ORDER.index('SCALE'), 1.0)
-        alpha = 1.0 + self.coef_scale * (alpha - 1.0)
-        wB = steer_scale_filters_per_sample(wB, alpha)
+        def _apply_group(tag, neutral, transform_fn):
+            idx = PERTURB_ORDER.index(tag)
+            active = (z[:, idx] > 0.5)
+            if not torch.any(active):
+                return
+            param = torch.nan_to_num(s[:, idx])
+            param = transform_fn(param)
+            full_param = torch.full_like(param, neutral)
+            full_param[active] = param[active]
+            nonlocal wB
+            if tag == 'CFO':
+                wB = steer_cfo_filters_per_sample(wB, fs, full_param)
+            elif tag == 'SCALE':
+                wB = steer_scale_filters_per_sample(wB, full_param)
+            elif tag == 'GAIN':
+                theta = torch.zeros_like(full_param)
+                wB = steer_gain_filters_per_sample(wB, full_param, theta)
+            elif tag == 'CHIRP':
+                wB = steer_chirp_filters_per_sample(wB, fs, full_param)
+            elif tag == 'SHIFT':
+                wB = steer_shift_filters_per_sample(wB, full_param.round())
+            applied[tag] = bool(active.any())
 
-        # CFO: 0 -> 中性；f0' = coef_cfo * f0
-        f0 = _mask_param(PERTURB_ORDER.index('CFO'), 0.0)
-        f0 = self.coef_cfo * f0
-        wB = steer_cfo_filters_per_sample(wB, fs, f0)
-
-        # CHIRP: 0 -> 中性；a' = coef_chirp * a
-        a  = _mask_param(PERTURB_ORDER.index('CHIRP'), 0.0)
-        a  = self.coef_chirp * a
-        wB = steer_chirp_filters_per_sample(wB, fs, a)
-
-        # GAIN: 1 -> 中性；rho' = 1 + coef_gain * (rho - 1)
-        rho = _mask_param(PERTURB_ORDER.index('GAIN'), 1.0)
-        rho = 1.0 + self.coef_gain * (rho - 1.0)
-        theta = torch.zeros_like(rho)
-        wB = steer_gain_filters_per_sample(wB, rho, theta)
+        _apply_group('SCALE', 1.0, lambda v: 1.0 + self.coef_scale * (v - 1.0))
+        _apply_group('CFO',   0.0, lambda v: self.coef_cfo * v)
+        _apply_group('CHIRP', 0.0, lambda v: self.coef_chirp * v)
+        _apply_group('GAIN',  1.0, lambda v: 1.0 + self.coef_gain * (v - 1.0))
+        _apply_group('SHIFT', 0.0, lambda v: v)
 
         OC, IC, _, kW = w0.shape
         xG = x.reshape(1, B*IC, 1, L)               # [1,B*IC,1,L]
@@ -171,10 +186,6 @@ class SteerableFirstLayerPerSample(nn.Module):
                 self.last_debug = {
                     "steer_applied": True,
                     "deltaW_rel_norm_mean": float(diff.item()),
-                    "SCALE": True, "CFO": True, "CHIRP": True, "GAIN": True,
-                    "SCALE_mean": float(alpha.mean().item()),
-                    "CFO_mean": float(f0.mean().item()),
-                    "CHIRP_mean": float(a.mean().item()),
-                    "GAIN_mean": float(rho.mean().item()),
+                    **{tag: bool(applied[tag]) for tag in applied},
                 }
         return y
