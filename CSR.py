@@ -1,14 +1,20 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
-import os, sys, time, json, csv, argparse, datetime, os.path as osp
+import os, time, json, csv, datetime, math, os.path as osp
+from types import SimpleNamespace
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 
+import matplotlib
+
+matplotlib.use("Agg")  # 无图形界面环境下仍可绘图
+import matplotlib.pyplot as plt
+
 import mydata_read
 import mymodel1
-from utils import AverageMeter, Logger
+from utils import AverageMeter
 from pytorchtools import EarlyStopping
 
 
@@ -98,50 +104,6 @@ def _maybe_manipulate_zs(z, s, args):
     return z, s
 
 
-# ------------------------------
-# Baseline 训练期：经验分布扰动增强（不依赖 z/s）
-# ------------------------------
-def _apply_iq_perturb_empirical(x, fs, mu, sd, p=0.8):
-    """
-    x: [B,2,1,L], fs: float
-    mu/sd: 长度5列表，按 ['CFO','SCALE','GAIN','SHIFT','CHIRP']
-    p: 应用某个扰动的概率（独立）
-    """
-    if p <= 0: return x
-    B, _, _, L = x.shape
-    device = x.device
-    n = torch.arange(L, device=device, dtype=torch.float32)[None, :]
-    I = x[:, 0, 0, :]
-    Q = x[:, 1, 0, :]
-
-    # CFO
-    if torch.rand(1).item() < p and sd[0] > 0:
-        f0 = torch.normal(mean=torch.tensor(mu[0], device=device), std=torch.tensor(sd[0], device=device), size=(B,))
-        phi = 2.0 * torch.pi * f0[:, None] * n / float(fs)
-        c, s = torch.cos(phi), torch.sin(phi)
-        I, Q = I * c - Q * s, I * s + Q * c
-
-    # CHIRP
-    if torch.rand(1).item() < p and sd[4] > 0:
-        a = torch.normal(mean=torch.tensor(mu[4], device=device), std=torch.tensor(sd[4], device=device), size=(B,))
-        t = n / float(fs)
-        phi2 = torch.pi * a[:, None] * (t ** 2)
-        c2, s2 = torch.cos(phi2), torch.sin(phi2)
-        I, Q = I * c2 - Q * s2, I * s2 + Q * c2
-
-    # GAIN（幅度）
-    if torch.rand(1).item() < p and sd[2] > 0:
-        rho = torch.normal(mean=torch.tensor(mu[2], device=device), std=torch.tensor(sd[2], device=device), size=(B,))
-        rho = rho.clamp(0.5, 1.5)
-        I = rho[:, None] * I
-        Q = rho[:, None] * Q
-
-    out = x.clone()
-    out[:, 0, 0, :] = I
-    out[:, 1, 0, :] = Q
-    return out
-
-
 # ---- Mixup ----
 def _mixup(x, y, alpha=0.2):
     if alpha is None or alpha <= 0:
@@ -215,33 +177,39 @@ def train_one_epoch(model, criterion, optimizer, loader, device, args):
         if s is not None: s = torch.as_tensor(s, device=device)
         z, s = _maybe_manipulate_zs(z, s, args)
 
-        # 仅对 Baseline 在训练期做经验分布扰动增强
-        is_baseline = model.__class__.__name__ == 'PlainCNNBaseline'
-        if is_baseline and args.baseline_augment:
-            x = _apply_iq_perturb_empirical(
-                x, fs=getattr(args, 'fs_cached', 50e6),
-                mu=getattr(args, 'emp_mu', [0,1,1,0,0]),
-                sd=getattr(args, 'emp_sd', [1,0.1,0.1,1,1]),
-                p=args.aug_prob
-            )
+        x_eval = x  # 留一份原始样本用于精度统计
 
         # Mixup
         x_mix, y_a, y_b, _, lam = _mixup(x, y, alpha=args.mixup_alpha)
 
         if (z is not None) and (s is not None):
-            logits, feat = model(x_mix, z, s)
+            logits, _ = model(x_mix, z, s)
         elif z is not None:
-            logits, feat = model(x_mix, z)
+            logits, _ = model(x_mix, z)
         else:
-            logits, feat = model(x_mix)
+            logits, _ = model(x_mix)
 
         loss = lam * criterion(logits, y_a) + (1.0 - lam) * criterion(logits, y_b) if y_b is not None else criterion(logits, y)
 
         optimizer.zero_grad(); loss.backward(); optimizer.step()
 
         losses.update(loss.item(), y.size(0))
-        pred = logits.argmax(1)
-        correct += (pred == y).sum().item(); total += y.size(0)
+
+        # 以 eval 模式重新计算原始样本的精度，避免 Mixup 影响
+        with torch.no_grad():
+            prev_mode = model.training
+            model.eval()
+            if (z is not None) and (s is not None):
+                logits_eval, _ = model(x_eval, z, s)
+            elif z is not None:
+                logits_eval, _ = model(x_eval, z)
+            else:
+                logits_eval, _ = model(x_eval)
+            pred = logits_eval.argmax(1)
+            correct += (pred == y).sum().item()
+            total += y.size(0)
+            if prev_mode:
+                model.train()
 
         if (i + 1) % args.print_freq == 0:
             print(f"  iter {i+1:04d} | loss {losses.avg:.4f}")
@@ -251,66 +219,212 @@ def train_one_epoch(model, criterion, optimizer, loader, device, args):
 
 
 @torch.no_grad()
-def evaluate(model, criterion, loader, device, args, mode="normal", print_debug=False):
+def evaluate(model, criterion, loader, device, args, print_debug=False,
+             max_batches=None, collect_outputs=False):
     model.eval()
+    _set_steer_disabled(model, False)
 
-    bak_shuffle, bak_zeroz, bak_zeros = args.shuffle_z, args.zero_z, args.zero_s
-    try:
-        if mode == "no_steer":
-            _set_steer_disabled(model, True)
-            args.shuffle_z, args.zero_z, args.zero_s = False, False, False
-        elif mode == "shuffle_z":
-            _set_steer_disabled(model, False)
-            args.shuffle_z, args.zero_z, args.zero_s = True, False, False
-        else:
-            _set_steer_disabled(model, False)
-            args.shuffle_z, args.zero_z, args.zero_s = False, False, False
+    losses = AverageMeter()
+    correct = total = 0
+    last_dbg = {}
+    logits_all = []
+    labels_all = []
+    preds_all = []
 
-        print(f"[EVAL MODE] {mode} | steer_disabled={'True' if (mode=='no_steer') else 'False'}")
+    for bi, batch in enumerate(loader):
+        logits, feat, y, dbg = _forward(model, batch, device, args, want_debug=print_debug)
+        loss = criterion(logits, y)
+        losses.update(loss.item(), y.size(0))
+        pred = logits.argmax(1)
+        correct += (pred == y).sum().item(); total += y.size(0)
+        if dbg:
+            last_dbg = dbg
+        if collect_outputs:
+            logits_all.append(logits.detach().cpu())
+            labels_all.append(y.detach().cpu())
+            preds_all.append(pred.detach().cpu())
+        if max_batches is not None and (bi + 1) >= max_batches:
+            break
 
-        losses = AverageMeter()
-        correct = total = 0
-        last_dbg = {}
+    acc = 100.0 * correct / max(1, total)
+    if print_debug and last_dbg:
+        print("[FirstLayer Debug]", last_dbg)
 
-        for batch in loader:
-            logits, feat, y, dbg = _forward(model, batch, device, args, want_debug=print_debug)
-            loss = criterion(logits, y)
-            losses.update(loss.item(), y.size(0))
-            pred = logits.argmax(1)
-            correct += (pred == y).sum().item(); total += y.size(0)
-            if dbg: last_dbg = dbg
-
-        acc = 100.0 * correct / max(1, total)
-        if print_debug and last_dbg:
-            print("[FirstLayer Debug]", last_dbg)
-    finally:
-        args.shuffle_z, args.zero_z, args.zero_s = bak_shuffle, bak_zeroz, bak_zeros
-        _set_steer_disabled(model, False)
+    if collect_outputs:
+        outputs = dict(
+            logits=torch.cat(logits_all) if logits_all else torch.empty((0,)),
+            labels=torch.cat(labels_all) if labels_all else torch.empty((0,), dtype=torch.long),
+            preds=torch.cat(preds_all) if preds_all else torch.empty((0,), dtype=torch.long),
+        )
+        return acc, losses.avg, outputs
 
     return acc, losses.avg
 
 
-@torch.no_grad()
-def test_metrics(model, loader, device, args):
-    model.eval()
-    total = 0
-    top1 = top2 = top3 = top5 = 0.0
-    for batch in loader:
-        logits, feat, y, _ = _forward(model, batch, device, args, want_debug=False)
-        maxk = 5
-        _, topk = logits.topk(maxk, 1, True, True)
-        topk = topk.t()
-        corr = topk.eq(y.view(1, -1).expand_as(topk))
-        top1 += corr[:1].reshape(-1).float().sum().item()
-        top2 += corr[:2].any(0).float().sum().item()
-        top3 += corr[:3].any(0).float().sum().item()
-        top5 += corr[:5].any(0).float().sum().item()
-        total += y.size(0)
-    return dict(
-        top1=top1/total*100.0, top2=top2/total*100.0,
-        top3=top3/total*100.0, top5=top5/total*100.0
-    )
+def _summarize_class_balance(labels, indices, tag):
+    from collections import Counter
 
+    cnt = Counter(int(labels[i]) for i in indices)
+    total = float(len(indices))
+    if total == 0:
+        print(f"[{tag}] split为空")
+        return
+
+    values = np.array([cnt.get(k, 0) for k in sorted(cnt.keys())], dtype=np.float32)
+    print(f"[{tag}] 总样本 {int(total)} | min={values.min()} max={values.max()} "
+          f"mean={values.mean():.1f} std={values.std():.1f}")
+    top_k = 10
+    most_common = cnt.most_common(top_k)
+    least_common = sorted(cnt.items(), key=lambda kv: kv[1])[:top_k]
+    print(f"  Top{top_k} 类别(样本数): {most_common}")
+    print(f"  Tail{top_k} 类别(样本数): {least_common}")
+
+
+def _compute_confusion_matrix(labels, preds, num_classes):
+    cm = np.zeros((num_classes, num_classes), dtype=np.int64)
+    for t, p in zip(labels, preds):
+        if 0 <= t < num_classes and 0 <= p < num_classes:
+            cm[t, p] += 1
+    return cm
+
+
+def _classification_report_from_cm(cm):
+    eps = 1e-9
+    tp = np.diag(cm).astype(np.float64)
+    per_class_sum = cm.sum(axis=1).astype(np.float64)
+    pred_class_sum = cm.sum(axis=0).astype(np.float64)
+
+    precision = tp / (pred_class_sum + eps)
+    recall = tp / (per_class_sum + eps)
+    f1 = 2 * precision * recall / (precision + recall + eps)
+
+    support = per_class_sum
+    accuracy = tp.sum() / max(cm.sum(), 1)
+    macro_precision = float(np.nanmean(precision))
+    macro_recall = float(np.nanmean(recall))
+    macro_f1 = float(np.nanmean(f1))
+
+    weighted_precision = float(np.nansum(precision * support) / max(support.sum(), eps))
+    weighted_recall = float(np.nansum(recall * support) / max(support.sum(), eps))
+    weighted_f1 = float(np.nansum(f1 * support) / max(support.sum(), eps))
+
+    report = {
+        "accuracy": float(accuracy * 100.0),
+        "macro_precision": macro_precision * 100.0,
+        "macro_recall": macro_recall * 100.0,
+        "macro_f1": macro_f1 * 100.0,
+        "weighted_precision": weighted_precision * 100.0,
+        "weighted_recall": weighted_recall * 100.0,
+        "weighted_f1": weighted_f1 * 100.0,
+        "per_class": [
+            {
+                "index": int(i),
+                "precision": float(precision[i] * 100.0),
+                "recall": float(recall[i] * 100.0),
+                "f1": float(f1[i] * 100.0),
+                "support": int(support[i]),
+            }
+            for i in range(len(tp))
+        ],
+    }
+    return report
+
+
+def _plot_confusion_matrix(cm, class_names, save_path, normalize=True, cmap='Blues'):
+    if normalize:
+        cm_sum = cm.sum(axis=1, keepdims=True)
+        cm_display = np.divide(cm, cm_sum, out=np.zeros_like(cm, dtype=np.float64), where=cm_sum != 0)
+    else:
+        cm_display = cm.astype(np.float64)
+
+    plt.figure(figsize=(10, 8))
+    plt.imshow(cm_display, interpolation='nearest', cmap=cmap)
+    plt.title('Confusion Matrix' + (' (Normalized)' if normalize else ''))
+    plt.colorbar()
+
+    ticks = np.arange(len(class_names))
+    plt.xticks(ticks, class_names, rotation=90)
+    plt.yticks(ticks, class_names)
+
+    fmt = '.2f' if normalize else 'd'
+    thresh = cm_display.max() / 2.0 if cm_display.size else 0
+    for i, j in np.ndindex(cm.shape):
+        value = cm_display[i, j]
+        if normalize:
+            text = f"{value:.2f}"
+        else:
+            text = f"{int(value)}"
+        plt.text(j, i, text,
+                 horizontalalignment="center",
+                 color="white" if value > thresh else "black",
+                 fontsize=7)
+
+    plt.tight_layout()
+    plt.ylabel('True label')
+    plt.xlabel('Predicted label')
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _plot_training_curves(history, save_path):
+    if not history:
+        return
+    epochs = [h['epoch'] for h in history]
+    train_acc = [h.get('train_acc', float('nan')) for h in history]
+    eval_acc = [h.get('val_acc', float('nan')) for h in history]
+    train_loss = [h.get('train_loss', float('nan')) for h in history]
+    val_loss = [h.get('val_loss', float('nan')) for h in history]
+    train_eval_acc = [h.get('train_eval_acc', float('nan')) for h in history]
+
+    plt.figure(figsize=(10, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(epochs, train_acc, label='Train (mixup)')
+    plt.plot(epochs, eval_acc, label='Validation')
+    plt.plot(epochs, train_eval_acc, label='Train (eval)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Accuracy Curves')
+    plt.legend()
+
+    plt.subplot(1, 2, 2)
+    plt.plot(epochs, train_loss, label='Train Loss')
+    plt.plot(epochs, val_loss, label='Validation Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.title('Loss Curves')
+    plt.legend()
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+
+
+def _save_report_csv(report, save_path):
+    fieldnames = ['class_index', 'precision', 'recall', 'f1', 'support']
+    with open(save_path, 'w', newline='', encoding='utf-8') as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        for item in report['per_class']:
+            writer.writerow({
+                'class_index': item['index'],
+                'precision': f"{item['precision']:.2f}",
+                'recall': f"{item['recall']:.2f}",
+                'f1': f"{item['f1']:.2f}",
+                'support': item['support'],
+            })
+
+
+def _calc_topk_from_logits(logits, labels, ks=(1, 2, 3, 5)):
+    if logits.numel() == 0:
+        return {f"top{k}": float('nan') for k in ks}
+    max_k = min(max(ks), logits.size(1))
+    _, topk = torch.topk(logits, max_k, dim=1)
+    results = {}
+    for k in ks:
+        kk = min(k, topk.size(1))
+        corr = topk[:, :kk].eq(labels.view(-1, 1)).any(dim=1).float().mean().item() * 100.0
+        results[f"top{k}"] = corr
+    return results
 
 def run_one_model(args, model_name, data_path, save_dir, device):
     print("="*80)
@@ -348,6 +462,10 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     validate_set= Subset(dataset, va_idx)
     test_set    = Subset(dataset, te_idx)
 
+    _summarize_class_balance(ys, tr_idx, "TRAIN")
+    _summarize_class_balance(ys, va_idx, "VAL")
+    _summarize_class_balance(ys, te_idx, "TEST")
+
     pin = device.type == 'cuda'
     trainloader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True,
                              num_workers=args.workers, drop_last=False, pin_memory=pin)
@@ -356,37 +474,42 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     testloader  = DataLoader(test_set, batch_size=args.batch_size, shuffle=False,
                              num_workers=args.workers, drop_last=False, pin_memory=pin)
 
+    # 额外取一部分训练集用于评估环节，帮助诊断训练/验证差距
+    frac = float(getattr(args, 'train_eval_fraction', 0.25))
+    frac = max(0.0, min(1.0, frac))
+    if frac <= 0 or len(tr_idx) == 0:
+        eval_indices = tr_idx
+    elif frac >= 1.0:
+        eval_indices = tr_idx
+    else:
+        n_eval = max(1, int(math.ceil(len(tr_idx) * frac)))
+        eval_indices = rng.choice(tr_idx, size=n_eval, replace=False).tolist()
+    train_eval_set = Subset(dataset, eval_indices)
+    train_eval_loader = DataLoader(
+        train_eval_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.workers,
+        drop_last=False,
+        pin_memory=pin,
+    )
+
     # 看看 z/s 是否正常
     summarize_zs(trainloader, tag="train", max_batches=50)
     summarize_zs(valloader,  tag="val",   max_batches=50)
 
-    # 模型（把 steer 系数与调试开关传入）
+    # 模型（仅支持 P4 系列别名）
     model = mymodel1.create(
-        name=model_name, num_classes=args.class_num, fs=fs, use_blurpool=True,
+        name=model_name,
+        num_classes=args.class_num,
+        fs=fs,
         debug_first=args.first_debug,
-        coef_scale=args.coef_scale, coef_gain=args.coef_gain,
-        coef_cfo=args.coef_cfo, coef_chirp=args.coef_chirp
+        coef_scale=args.coef_scale,
+        coef_gain=args.coef_gain,
+        coef_cfo=args.coef_cfo,
+        coef_chirp=args.coef_chirp,
     )
     model = model.to(device)
-
-    # 经验分布统计：仅用训练集（z==1 的位置）
-    S_all = torch.as_tensor(getattr(dataset, 'S') if getattr(dataset, 'S', None) is not None else np.zeros((len(dataset), 5))).float()
-    Z_all = torch.as_tensor(getattr(dataset, 'Z') if getattr(dataset, 'Z', None) is not None else np.zeros((len(dataset), 5))).float()
-    S_tr = S_all[tr_idx]; Z_tr = Z_all[tr_idx]
-    mu, sd = [], []
-    for j in range(S_tr.shape[1] if S_tr.ndim == 2 else 0):
-        m = Z_tr[:, j] > 0.5
-        vals = S_tr[m, j]
-        if vals.numel() < 10:
-            mu.append(0.0); sd.append(0.0)
-        else:
-            q1, q99 = torch.quantile(vals, 0.01), torch.quantile(vals, 0.99)
-            v = vals.clamp(q1, q99)
-            mu.append(float(v.mean().item()))
-            sd.append(float(v.std(unbiased=False).item() + 1e-6))
-    args.emp_mu = mu if mu else [0,1,1,0,0]
-    args.emp_sd = sd if sd else [1,0.1,0.1,1,1]
-    args.fs_cached = fs
 
     # ====== class_weight from train_set frequency ======
     num_classes = args.class_num
@@ -398,7 +521,7 @@ def run_one_model(args, model_name, data_path, save_dir, device):
     class_weight = torch.as_tensor(class_weight, dtype=torch.float32, device=device)
 
     # 优化器 / 早停 / 调度
-    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=0.1)
+    criterion = nn.CrossEntropyLoss(weight=class_weight, label_smoothing=args.label_smoothing)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.wd)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.max_epoch)
 
@@ -407,135 +530,254 @@ def run_one_model(args, model_name, data_path, save_dir, device):
 
     # 训练循环
     t0 = time.time()
-    best_epoch = -1
+    history = []
+    best_epoch = 0
+    best_val_loss = float('inf')
+    best_val_acc = -float('inf')
     for epoch in range(args.max_epoch):
         print(f"==> Epoch {epoch+1}/{args.max_epoch}")
         a_tr, l_tr = train_one_epoch(model, criterion, optimizer, trainloader, device, args)
-        a_ev, l_ev = evaluate(model, criterion, valloader, device, args, mode="normal", print_debug=args.first_debug)
-        print(f"Train_Acc(%): {a_tr:.2f}  Eval_Acc(%): {a_ev:.2f}")
-        print(f"Train_Loss: {l_tr:.4f}  Eval_Loss: {l_ev:.4f}")
+        a_tr_eval, l_tr_eval = evaluate(
+            model, criterion, train_eval_loader, device, args,
+            print_debug=False,
+            max_batches=args.train_eval_max_batches,
+        )
+        a_ev, l_ev = evaluate(model, criterion, valloader, device, args, print_debug=args.first_debug)
+        print(
+            f"Train_Acc(%): {a_tr:.2f}  TrainEval_Acc(%): {a_tr_eval:.2f}  Eval_Acc(%): {a_ev:.2f}"
+        )
+        print(
+            f"Train_Loss: {l_tr:.4f}  TrainEval_Loss: {l_tr_eval:.4f}  Eval_Loss: {l_ev:.4f}"
+        )
+
+        history.append({
+            "epoch": int(epoch + 1),
+            "train_acc": float(a_tr),
+            "train_loss": float(l_tr),
+            "train_eval_acc": float(a_tr_eval),
+            "train_eval_loss": float(l_tr_eval),
+            "val_acc": float(a_ev),
+            "val_loss": float(l_ev),
+        })
+
+        if l_ev < best_val_loss:
+            best_val_loss = float(l_ev)
+            best_epoch = epoch + 1
+        if a_ev > best_val_acc:
+            best_val_acc = float(a_ev)
 
         early_stopping(l_ev, model)
         if early_stopping.early_stop:
             print("Early stopping")
-            best_epoch = epoch + 1 - early_stopping.counter
             break
 
         scheduler.step()
 
-    if best_epoch < 0:
-        best_epoch = args.max_epoch
+    if best_epoch == 0:
+        best_epoch = len(history)
 
-    print("训练耗时：", str(datetime.timedelta(seconds=round(time.time() - t0))))
+    elapsed = time.time() - t0
+    print("训练耗时：", str(datetime.timedelta(seconds=round(elapsed))))
 
-    # 测试 & 对照评估
+    # 验证 & 测试
     model.load_state_dict(torch.load(ckpt_path, map_location=device))
-    print("####### 测试")
-    _ , _ = evaluate(model, criterion, valloader, device, args, mode="normal", print_debug=True)
 
-    print("== 对照评估（验证集）==")
-    acc_n, _  = evaluate(model, criterion, valloader, device, args, mode='normal')
-    acc_ns, _ = evaluate(model, criterion, valloader, device, args, mode='no_steer')
-    acc_sz, _ = evaluate(model, criterion, valloader, device, args, mode='shuffle_z')
-    print(f"[COMPARE] normal={acc_n:.2f}% | no_steer={acc_ns:.2f}% | shuffle_z={acc_sz:.2f}%")
+    class_names = [str(i) for i in range(num_classes)]
 
-    print("####### 最终测试集指标")
-    test_stats = test_metrics(model, testloader, device, args)
-    print(f"Top1:{test_stats['top1']:5.2f}%  Top2:{test_stats['top2']:5.2f}%  Top3:{test_stats['top3']:5.2f}%  Top5:{test_stats['top5']:5.2f}%")
+    print("####### 训练集抽样复检")
+    train_diag_acc, train_diag_loss, train_diag_outputs = evaluate(
+        model, criterion, train_eval_loader, device, args,
+        print_debug=False,
+        max_batches=args.train_eval_max_batches,
+        collect_outputs=True,
+    )
+    print(f"TrainEval_Acc(%): {train_diag_acc:.2f}  TrainEval_Loss: {train_diag_loss:.4f}")
+    train_diag_topk = _calc_topk_from_logits(train_diag_outputs['logits'], train_diag_outputs['labels'])
+
+    print("####### 验证集评估")
+    acc_val, val_loss, val_outputs = evaluate(
+        model, criterion, valloader, device, args,
+        print_debug=True,
+        collect_outputs=True,
+    )
+    print(f"Val_Acc(%): {acc_val:.2f}  Val_Loss: {val_loss:.4f}")
+
+    print("####### 测试集评估")
+    acc_test, test_loss, test_outputs = evaluate(
+        model, criterion, testloader, device, args,
+        print_debug=False,
+        collect_outputs=True,
+    )
+    print(f"Test_Acc(%): {acc_test:.2f}  Test_Loss: {test_loss:.4f}")
+
+    val_labels = val_outputs['labels'].numpy().astype(np.int64)
+    val_preds = val_outputs['preds'].numpy().astype(np.int64)
+    test_labels = test_outputs['labels'].numpy().astype(np.int64)
+    test_preds = test_outputs['preds'].numpy().astype(np.int64)
+
+    cm_val = _compute_confusion_matrix(val_labels, val_preds, num_classes)
+    cm_test = _compute_confusion_matrix(test_labels, test_preds, num_classes)
+
+    report_val = _classification_report_from_cm(cm_val)
+    report_test = _classification_report_from_cm(cm_test)
+
+    val_topk = _calc_topk_from_logits(val_outputs['logits'], val_outputs['labels'])
+    test_topk = _calc_topk_from_logits(test_outputs['logits'], test_outputs['labels'])
+
+    # 保存可视化和详细数据
+    _plot_confusion_matrix(cm_val, class_names, osp.join(save_dir, 'val_confusion_matrix.png'), normalize=True)
+    _plot_confusion_matrix(cm_val, class_names, osp.join(save_dir, 'val_confusion_matrix_counts.png'), normalize=False)
+    _plot_confusion_matrix(cm_test, class_names, osp.join(save_dir, 'test_confusion_matrix.png'), normalize=True)
+    _plot_confusion_matrix(cm_test, class_names, osp.join(save_dir, 'test_confusion_matrix_counts.png'), normalize=False)
+    _plot_training_curves(history, osp.join(save_dir, 'training_curves.png'))
+    _save_report_csv(report_val, osp.join(save_dir, 'val_classification_report.csv'))
+    _save_report_csv(report_test, osp.join(save_dir, 'test_classification_report.csv'))
+
+    np.savez_compressed(
+        osp.join(save_dir, 'val_predictions.npz'),
+        logits=val_outputs['logits'].numpy(),
+        labels=val_labels,
+        preds=val_preds,
+    )
+    np.savez_compressed(
+        osp.join(save_dir, 'test_predictions.npz'),
+        logits=test_outputs['logits'].numpy(),
+        labels=test_labels,
+        preds=test_preds,
+    )
+    np.savez_compressed(
+        osp.join(save_dir, 'train_eval_predictions.npz'),
+        logits=train_diag_outputs['logits'].numpy(),
+        labels=train_diag_outputs['labels'].numpy().astype(np.int64),
+        preds=train_diag_outputs['preds'].numpy().astype(np.int64),
+    )
+
+    metrics = {
+        "val_acc": float(acc_val),
+        "val_loss": float(val_loss),
+        "val_macro_f1": float(report_val['macro_f1']),
+        "val_macro_precision": float(report_val['macro_precision']),
+        "val_macro_recall": float(report_val['macro_recall']),
+        "val_top1": float(val_topk['top1']),
+        "val_top3": float(val_topk.get('top3', float('nan'))),
+        "val_top5": float(val_topk.get('top5', float('nan'))),
+        "test_acc": float(acc_test),
+        "test_loss": float(test_loss),
+        "test_macro_f1": float(report_test['macro_f1']),
+        "test_macro_precision": float(report_test['macro_precision']),
+        "test_macro_recall": float(report_test['macro_recall']),
+        "test_top1": float(test_topk['top1']),
+        "test_top3": float(test_topk.get('top3', float('nan'))),
+        "test_top5": float(test_topk.get('top5', float('nan'))),
+        "train_eval_acc_final": float(train_diag_acc),
+        "train_eval_loss_final": float(train_diag_loss),
+        "train_eval_top1": float(train_diag_topk['top1']),
+        "best_epoch": int(best_epoch),
+        "best_val_loss": float(best_val_loss),
+        "best_val_acc": float(best_val_acc),
+        "train_time_sec": float(elapsed),
+    }
 
     # 写 CSV
-    csv_path = osp.join(save_dir, "compare_summary.csv")
+    csv_path = osp.join(save_dir, "model_summary.csv")
     new_row = {
+        **{k: (f"{v:.2f}" if isinstance(v, float) else v) for k, v in metrics.items()},
         "model": model_name,
-        "best_epoch": best_epoch,
-        "val_normal": f"{acc_n:.2f}",
-        "val_no_steer": f"{acc_ns:.2f}",
-        "val_shuffle_z": f"{acc_sz:.2f}",
-        "test_top1": f"{test_stats['top1']:.2f}",
-        "test_top2": f"{test_stats['top2']:.2f}",
-        "test_top3": f"{test_stats['top3']:.2f}",
-        "test_top5": f"{test_stats['top5']:.2f}",
         "timestamp": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+    fieldnames = ["model"] + [k for k in metrics.keys()] + ["timestamp"]
     write_header = (not osp.exists(csv_path))
     with open(csv_path, "a", newline='', encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=list(new_row.keys()))
-        if write_header: writer.writeheader()
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
         writer.writerow(new_row)
     print(f"[CSV] 结果已追加到: {csv_path}")
 
-    return {
-        "val_normal": acc_n, "val_no_steer": acc_ns, "val_shuffle_z": acc_sz,
-        **test_stats
+    summary = {
+        "model": model_name,
+        "metrics": metrics,
+        "history": history,
+        "save_dir": save_dir,
+        "val_report": report_val,
+        "test_report": report_test,
+        "val_confusion_matrix": cm_val.tolist(),
+        "test_confusion_matrix": cm_test.tolist(),
+        "artifacts": {
+            "training_curves": osp.join(save_dir, 'training_curves.png'),
+            "val_confusion_matrix_norm": osp.join(save_dir, 'val_confusion_matrix.png'),
+            "val_confusion_matrix_counts": osp.join(save_dir, 'val_confusion_matrix_counts.png'),
+            "test_confusion_matrix_norm": osp.join(save_dir, 'test_confusion_matrix.png'),
+            "test_confusion_matrix_counts": osp.join(save_dir, 'test_confusion_matrix_counts.png'),
+            "val_report_csv": osp.join(save_dir, 'val_classification_report.csv'),
+            "test_report_csv": osp.join(save_dir, 'test_classification_report.csv'),
+            "val_predictions": osp.join(save_dir, 'val_predictions.npz'),
+            "test_predictions": osp.join(save_dir, 'test_predictions.npz'),
+            "train_eval_predictions": osp.join(save_dir, 'train_eval_predictions.npz'),
+        },
     }
+
+    json_path = osp.join(save_dir, f"{model_name}_summary.json")
+    with open(json_path, 'w', encoding='utf-8') as f:
+        json.dump(summary, f, ensure_ascii=False, indent=2)
+    print(f"[JSON] 训练日志已保存到: {json_path}")
+
+    return summary
 
 
 def main():
-    parser = argparse.ArgumentParser("Group-Steer vs CNN Baseline - 100 epochs benchmark")
-    parser.add_argument('--data', type=str, default='./data/ADS-B_0dB_train.mat')
-    parser.add_argument('--save-root', type=str, default='./runs_benchmark')
-    parser.add_argument('--class_num', type=int, default=100)
-    parser.add_argument('--batch-size', type=int, default=256)
-    parser.add_argument('--workers', type=int, default=0)
-    parser.add_argument('--lr', type=float, default=1e-4)
-    parser.add_argument('--wd', type=float, default=1e-4)
-    parser.add_argument('--max-epoch', type=int, default=100)
-    parser.add_argument('--patience', type=int, default=20)
-    parser.add_argument('--gpu', type=str, default='0')
-    parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--first_debug', action='store_true')
-    parser.add_argument('--print_freq', type=int, default=5, help='打印间隔（iteration）')
+    """入口函数：直接在此修改数据路径和训练参数。"""
 
-    # z/s 评估开关
-    parser.add_argument('--shuffle_z', action='store_true')
-    parser.add_argument('--zero_z', action='store_true')
-    parser.add_argument('--zero_s', action='store_true')
+    config = SimpleNamespace(
+        data='./data/ADS-B_0dB_train.mat',
+        save_root='./runs_benchmark',
+        class_num=100,
+        batch_size=256,
+        workers=0,
+        lr=1e-4,
+        wd=1e-4,
+        max_epoch=100,
+        patience=20,
+        gpu='0',
+        seed=42,
+        first_debug=False,
+        print_freq=5,
+        shuffle_z=False,
+        zero_z=False,
+        zero_s=False,
+        coef_scale=0.5,
+        coef_gain=0.5,
+        coef_cfo=0.5,
+        coef_chirp=0.5,
+        prior_drop=0.0,
+        s_jitter=0.0,
+        mixup_alpha=0.0,
+        label_smoothing=0.05,
+        train_eval_fraction=0.25,
+        train_eval_max_batches=None,
+        model_name='p4',
+    )
 
-    # 选择模型
-    parser.add_argument('--which', type=str, default='both',
-                        choices=['both','steer','baseline'])
-
-    # steer 强度与先验衰减
-    parser.add_argument('--coef-scale', type=float, default=0.5)
-    parser.add_argument('--coef-gain',  type=float, default=0.5)
-    parser.add_argument('--coef-cfo',   type=float, default=0.5)
-    parser.add_argument('--coef-chirp', type=float, default=0.5)
-    parser.add_argument('--prior-drop', type=float, default=0.3,
-                        help='随机丢弃先验 z/s 的概率 [0,1]')
-    parser.add_argument('--s-jitter',   type=float, default=0.2,
-                        help='对先验 s 的乘性噪声幅度，0为不抖动')
-
-    # Baseline 训练增强
-    parser.add_argument('--baseline-augment', action='store_true',
-                        help='仅对基线在训练阶段启用经验分布扰动增强')
-    parser.add_argument('--aug-prob', type=float, default=0.8)
-
-    # Mixup
-    parser.add_argument('--mixup-alpha', type=float, default=0.2)
-
-    args = parser.parse_args()
-
-    os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu
+    os.environ['CUDA_VISIBLE_DEVICES'] = config.gpu
     use_gpu = torch.cuda.is_available()
     device = torch.device('cuda') if use_gpu else torch.device('cpu')
-    torch.manual_seed(args.seed)
-    if use_gpu: torch.cuda.manual_seed_all(args.seed)
+    torch.manual_seed(config.seed)
+    if use_gpu:
+        torch.cuda.manual_seed_all(config.seed)
 
-    models = []
-    if args.which in ('steer','both'):
-        models.append('PerturbAwareNetSteer')
-    if args.which in ('baseline','both'):
-        models.append('PerturbAblationNet')
+    print("程序：P4 群卷积模型训练")
+    print(f"数据路径：{config.data}")
+    print(f"模型：{config.model_name}")
+    print(
+        "Steer系数: "
+        f"scale={config.coef_scale} gain={config.coef_gain} "
+        f"cfo={config.coef_cfo} chirp={config.coef_chirp}"
+    )
 
-    print(f"程序：闭集识别（群作用验证，公平对照）")
-    print(f"数据：{args.data}")
-    print(f"模型列表：{models}")
-    print(f"Steer系数: scale={args.coef_scale} gain={args.coef_gain} cfo={args.coef_cfo} chirp={args.coef_chirp} | prior_drop={args.prior_drop} s_jitter={args.s_jitter}")
-    print(f"Baseline增强: baseline_augment={'ON' if args.baseline_augment else 'OFF'} (p={args.aug_prob})")
+    os.makedirs(config.save_root, exist_ok=True)
 
-    for m in models:
-        save_dir = osp.join(args.save_root, m)
-        run_one_model(args, m, args.data, save_dir, device)
+    save_dir = osp.join(config.save_root, config.model_name)
+    run_one_model(config, config.model_name, config.data, save_dir, device)
 
 
 if __name__ == '__main__':

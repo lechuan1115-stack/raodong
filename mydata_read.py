@@ -2,7 +2,12 @@
 # -*- coding:utf-8 -*-
 import numpy as np
 from torch.utils.data import Dataset
-import h5py, os, json
+import h5py, os, json, os.path as osp
+
+try:
+    from scipy.io import loadmat
+except Exception:  # pragma: no cover - scipy 可能缺失
+    loadmat = None
 
 # 与 gconv 中顺序保持一致
 PERTURB_TAGS = ['CFO', 'SCALE', 'GAIN', 'SHIFT', 'CHIRP']
@@ -111,6 +116,76 @@ def _maybe_read_S(hf, N):
 
     return None
 
+def _is_mat73(mat_path):
+    try:
+        with open(mat_path, 'rb') as fh:
+            header = fh.read(128)
+        return b'MATLAB 7.3 MAT-file' in header
+    except OSError:
+        return False
+
+
+def _load_mat_dict(mat_path):
+    if _is_mat73(mat_path):
+        print("[INFO] detected MATLAB v7.3 MAT-file, routing to HDF5 loader")
+        return None
+    if loadmat is None:
+        raise ImportError("scipy.io.loadmat 未安装，无法读取 .mat 数据")
+    kwargs = dict(struct_as_record=False, squeeze_me=True)
+    try:
+        mdict = loadmat(mat_path, **kwargs, simplify_cells=True)
+    except TypeError:
+        mdict = loadmat(mat_path, **kwargs)
+    return {k: v for k, v in mdict.items() if not k.startswith('__')}
+
+
+def _mat_coerce_numeric(obj):
+    if obj is None:
+        return None
+    if isinstance(obj, np.ndarray):
+        if obj.dtype == np.object_:
+            flat = [
+                _mat_coerce_numeric(item)
+                for item in obj.reshape(-1)
+            ]
+            if len(flat) == 0:
+                return np.array([])
+            if all(isinstance(v, np.ndarray) and v.shape == flat[0].shape for v in flat):
+                return np.stack(flat, axis=0)
+            try:
+                return np.array(flat)
+            except Exception:
+                return np.array(flat, dtype=object)
+        return obj
+    if np.isscalar(obj):
+        return np.array(obj)
+    if hasattr(obj, '_fieldnames'):
+        d = {name: _mat_coerce_numeric(getattr(obj, name)) for name in obj._fieldnames}
+        # 常见 real/imag 拆分
+        if {'real', 'imag'}.issubset(d.keys()):
+            return d['real'] + 1j * d['imag']
+        return d
+    if isinstance(obj, (list, tuple)):
+        flat = [_mat_coerce_numeric(v) for v in obj]
+        try:
+            return np.stack(flat, axis=0)
+        except Exception:
+            return np.array(flat, dtype=object)
+    try:
+        return np.array(obj)
+    except Exception:
+        return None
+
+
+def _mat_pick(mdict, candidates):
+    if mdict is None:
+        return None
+    for key in candidates:
+        if key in mdict:
+            return _mat_coerce_numeric(mdict[key])
+    return None
+
+
 def load_h5_with_perturb(h5_path, for_p4=True, shuffle=True, seed=42):
     h5_path = _check_path(h5_path)
     with h5py.File(h5_path, 'r') as hf:
@@ -211,9 +286,96 @@ def load_h5_with_perturb(h5_path, for_p4=True, shuffle=True, seed=42):
     }, ensure_ascii=False))
     return X.astype(np.float32), Y.astype(np.float32), Z, S, float(fs)
 
+
+def load_mat_with_perturb(mat_path, for_p4=True, shuffle=True, seed=42):
+    mat_path = _check_path(mat_path)
+    mdict = _load_mat_dict(mat_path)
+    if mdict is None:
+        # MATLAB v7.3 -> 直接当做 HDF5 读取
+        return load_h5_with_perturb(mat_path, for_p4=for_p4, shuffle=shuffle, seed=seed)
+    print(json.dumps({"keys": sorted(mdict.keys())}, ensure_ascii=False))
+
+    A = _mat_pick(mdict, ['train', 'data', 'IQ', 'iq', 'iq_data', 'signal', 'x', 'data_iq', 'test'])
+    if isinstance(A, dict):
+        raise RuntimeError("无法从 .mat 结构中解析 I/Q 数据，请检查字段命名")
+    if A is None:
+        raise RuntimeError("无法在 .mat 文件中找到 I/Q 数据字段")
+
+    Y = _mat_pick(mdict, ['trainlabel', 'testlabel', 'label', 'y', 'labels'])
+    if isinstance(Y, dict):
+        Y = None
+
+    fs_raw = _mat_pick(mdict, ['fs', 'Fs', 'FS', 'sample_rate', 'samp_rate', 'sampling_rate', 'sampling_frequency'])
+    try:
+        fs = float(np.array(fs_raw).squeeze()) if fs_raw is not None else 50e6
+    except Exception:
+        fs = 50e6
+
+    Z = _mat_pick(mdict, ['Z'])
+    if isinstance(Z, dict):
+        Z = None
+
+    S = _mat_pick(mdict, ['S', 'disturb_params'])
+    if isinstance(S, dict):
+        S = None
+
+    Xc = _as_complex_NL(A)
+    if Xc.ndim == 1:
+        Xc = Xc[None, :]
+    N, _ = Xc.shape
+
+    X = _complex_to_P4_input(Xc) if for_p4 else np.stack(
+        [np.real(Xc).astype(np.float32), np.imag(Xc).astype(np.float32)], axis=1
+    )
+
+    if Y is not None:
+        Y = np.array(Y).squeeze().astype(np.float32)
+        if Y.shape == ():
+            Y = np.repeat(Y, N)
+    else:
+        Y = np.zeros((N,), dtype=np.float32)
+
+    def _fix2(a, name):
+        if a is None:
+            return None
+        a = np.asarray(a)
+        if a.ndim == 2 and a.shape[0] == N:
+            return a.astype(np.float32)
+        if a.ndim == 2 and a.shape[1] == N:
+            return a.T.astype(np.float32)
+        print(f"[WARN] {name} shape mismatch -> ignoring {name}")
+        return None
+
+    Z = _fix2(Z, 'Z')
+    S = _fix2(S, 'S')
+
+    idx = np.arange(N)
+    if shuffle:
+        rng = np.random.RandomState(seed)
+        rng.shuffle(idx)
+    X = X[idx]
+    Y = Y[idx]
+    if Z is not None:
+        Z = Z[idx]
+    if S is not None:
+        S = S[idx]
+
+    print(json.dumps({
+        "summary": f"X{X.shape}, Y{Y.shape}, Z{None if Z is None else Z.shape}, "
+                   f"S{None if S is None else S.shape}, fs={fs}"
+    }, ensure_ascii=False))
+    return X.astype(np.float32), Y.astype(np.float32), Z, S, float(fs)
+
+
+def load_data_with_perturb(path, for_p4=True, shuffle=True, seed=42):
+    ext = osp.splitext(path)[1].lower()
+    if ext == '.mat':
+        return load_mat_with_perturb(path, for_p4=for_p4, shuffle=shuffle, seed=seed)
+    return load_h5_with_perturb(path, for_p4=for_p4, shuffle=shuffle, seed=seed)
+
 class SignalDatasetWithPerturb(Dataset):
     def __init__(self, data_path, for_p4=True, transform=None, shuffle=True, seed=42):
-        X, Y, Z, S, fs = load_h5_with_perturb(data_path, for_p4=for_p4, shuffle=shuffle, seed=seed)
+        X, Y, Z, S, fs = load_data_with_perturb(data_path, for_p4=for_p4, shuffle=shuffle, seed=seed)
         self.X, self.Y, self.Z, self.S, self.fs = X, Y, Z, S, fs
         self.transform = transform
 
