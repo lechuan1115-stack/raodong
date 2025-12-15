@@ -5,6 +5,8 @@ import shutil
 import os.path as osp
 
 import torch
+
+
 # 集合保存打印信息，loss的存储更新与一体
 def mkdir_if_missing(directory):
     if not osp.exists(directory):
@@ -14,11 +16,13 @@ def mkdir_if_missing(directory):
             if e.errno != errno.EEXIST:
                 raise
 
+
 class AverageMeter(object):
     """Computes and stores the average and current value.   计算和存储当前的平均值
-       
+
        Code imported from https://github.com/pytorch/examples/blob/master/imagenet/main.py#L247-L262
     """
+
     def __init__(self):
         self.reset()
 
@@ -34,6 +38,7 @@ class AverageMeter(object):
         self.count += n
         self.avg = self.sum / self.count
 
+
 def save_checkpoint(state, is_best, fpath='checkpoint.pth.tar'):
     mkdir_if_missing(osp.dirname(fpath))
     torch.save(state, fpath)
@@ -44,9 +49,10 @@ def save_checkpoint(state, is_best, fpath='checkpoint.pth.tar'):
 class Logger(object):
     """
     Write console output to external text file.
-    
+
     Code imported from https://github.com/Cysu/open-reid/blob/master/reid/utils/logging.py.
     """
+
     def __init__(self, fpath=None):
         self.console = sys.stdout
         self.file = None
@@ -58,7 +64,7 @@ class Logger(object):
         self.close()
 
     def __enter__(self):
-        pass
+        return self
 
     def __exit__(self, *args):
         self.close()
@@ -75,6 +81,6 @@ class Logger(object):
             os.fsync(self.file.fileno())
 
     def close(self):
-        self.console.close()
+        """Close the optional log file handle without touching stdout."""
         if self.file is not None:
             self.file.close()
